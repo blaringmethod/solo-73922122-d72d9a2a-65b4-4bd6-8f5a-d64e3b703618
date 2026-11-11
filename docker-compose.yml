@@ -1,10 +1,18 @@
 services:
-  mileage-matching-api:
+  bus-position-partition:
     build: .
-    image: bus-mileage-matching:1.0.0
-    container_name: bus-mileage-matching
+    image: bus-position-partition:1.0.0
+    container_name: bus-position-partition
     ports:
       - "8000:8000"
+    environment:
+      # 数据根目录（容器内），挂载到命名卷，重启保留已提交数据
+      BUS_DATA_DIR: /data
+      BUS_MAX_BATCH_RECORDS: "1000"
+      BUS_LEASE_TTL_SECONDS: "120"
+      BUS_REAP_GRACE_SECONDS: "30"
+    volumes:
+      - bus-position-data:/data
     restart: unless-stopped
     healthcheck:
       test:
@@ -16,3 +24,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  bus-position-data:

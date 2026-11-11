@@ -5,3 +5,7 @@ __pycache__/
 venv/
 *.egg-info/
 .DS_Store
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

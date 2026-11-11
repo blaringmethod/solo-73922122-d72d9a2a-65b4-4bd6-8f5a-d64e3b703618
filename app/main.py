@@ -1,92 +1,74 @@
-"""FastAPI 应用入口。
+"""公交定位分区 API 入口。
 
-启动：uvicorn app.main:app --host 0.0.0.0 --port 8000
-文档：/docs（Swagger UI）、/redoc、/openapi.json
+路由：
+* POST   /api/v1/partitions/{day}/batches           追加一批（1～1000 条）
+* POST   /api/v1/partitions/{day}/compact           按日压实碎文件
+* GET    /api/v1/partitions/{day}/records           流式读取（开始即快照）
+* GET    /api/v1/partitions/{day}/status            分区文件索引状态
+* POST   /api/v1/partitions/{day}/reap              手动回收 sealed 旧文件
+* GET    /health、/                                  运维入口
+
+交互式文档：/docs（Swagger UI，含追加/压实/读取示例）、/redoc。
+启动：uvicorn app.main:app --workers 2 --host 0.0.0.0 --port 8000
 """
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Body, FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import Body, FastAPI, HTTPException, Path
+from fastapi.responses import StreamingResponse
 
-from .matching import NoPathError, match_trip
+from . import db, storage
 from .schemas import (
-    CandidateInfo,
-    MatchFailure,
-    MatchRequest,
-    MatchResponse,
-    MatchedPoint,
-    MatchSuccess,
+    AppendBatchRequest,
+    AppendBatchResponse,
+    CompactResponse,
+    PartitionFileInfo,
+    PartitionStatusResponse,
+    ReapResponse,
+    append_openapi_examples,
+    validate_day,
 )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> Any:
+    # 每个 worker 启动：建库 + 崩溃恢复（compacting 回滚、孤儿文件清理）
+    db.init_db()
+    storage.recover_on_startup()
+    yield
+
 
 app = FastAPI(
-    title="公交行程里程匹配 API",
+    title="公交定位分区服务",
     version="1.0.0",
     description=(
-        "对单次行程的车载定位点沿有序线路折线做投影匹配，在「里程不倒退、"
-        "相邻里程差不超过速度上限 × 时间差」的约束下，返回总平方偏离最小的"
-        "完整路径；无完整路径时返回首个无法延续的位置及原因。坐标均为米制平面坐标。"
+        "按运营日接收车载定位小批次（1～1000 条/批），每批保存为不可变 "
+        "JSONL 文件，SQLite 记录文件索引；提供按日压实与流式读取。\n\n"
+        "关键语义：\n"
+        "- 追加：临时文件 fsync 后原子 rename + 索引事务，残片永不可见；\n"
+        "- 压实：保留全部记录、批次提交顺序与批内原序，不去重，并发追加"
+        "不丢失；\n"
+        "- 读取：请求开始即固定文件快照，压实/追加不改变本次内容；\n"
+        "- 回收：旧文件在所有读取结束（租约 + 按日文件锁双保险）后才删除；\n"
+        "- 并发：按运营日 flock，两个 worker 下不同日期互不阻塞。"
     ),
+    lifespan=lifespan,
 )
 
-# ---------------------------------------------------------------------------
-# OpenAPI 示例：包含环线重叠（共线）路段
-# 折线几何（单位米）：
-#   (0,0)->(100,0)->(100,100)->(0,100)->(0,0)->(0,-50)
-# 其中 0->1 段（(0,0)->(100,0)）与 4->3 段（(0,0)->(0,100) 反向即
-# (0,100)->(0,0)）在 (0,0) 周边形成环线重叠；闭合后第 4 段再次经过起点。
-# 定位点 (50, 2) 同时落在线段 0（里程 50）和闭合环线回来的共线位置上，
-# 由 DP 的里程单调性 + 速度约束完成消歧。
-# ---------------------------------------------------------------------------
-_OVERLAP_EXAMPLE: dict[str, Any] = {
-    "summary": "含共线重叠段的环线行程，DP 全局消歧",
-    "value": {
-        "polyline": [
-            {"x": 0, "y": 0},
-            {"x": 100, "y": 0},
-            {"x": 100, "y": 100},
-            {"x": 0, "y": 100},
-            {"x": 0, "y": 0},
-            {"x": 0, "y": -50},
-        ],
-        "points": [
-            {"x": 2, "y": 1, "timestamp": "2026-11-11T08:00:00"},
-            {"x": 50, "y": 2, "timestamp": "2026-11-11T08:00:50"},
-            {"x": 98, "y": 3, "timestamp": "2026-11-11T08:01:40"},
-            {"x": 102, "y": 50, "timestamp": "2026-11-11T08:02:40"},
-            {"x": 101, "y": 99, "timestamp": "2026-11-11T08:03:30"},
-            {"x": 50, "y": 102, "timestamp": "2026-11-11T08:04:30"},
-            {"x": 1, "y": 101, "timestamp": "2026-11-11T08:05:20"},
-            {"x": -2, "y": 50, "timestamp": "2026-11-11T08:06:20"},
-            {"x": -1, "y": 1, "timestamp": "2026-11-11T08:07:10"},
-            {"x": 0, "y": -30, "timestamp": "2026-11-11T08:08:00"},
-        ],
-        "max_deviation": 5.0,
-        "max_speed": 15.0,
-    },
-}
 
-_NO_PATH_EXAMPLE: dict[str, Any] = {
-    "summary": "相邻定位点里程增量超过速度上限 × 时间差",
-    "value": {
-        "polyline": [
-            {"x": 0, "y": 0},
-            {"x": 100, "y": 0},
-            {"x": 200, "y": 0},
-        ],
-        "points": [
-            {"x": 0, "y": 0, "timestamp": 0},
-            # 10 秒内沿线路前进 150 米，需要 15 m/s，超过上限 5 m/s（允许 50 米）
-            {"x": 150, "y": 0, "timestamp": 10},
-            {"x": 200, "y": 0, "timestamp": 20},
-        ],
-        "max_deviation": 5.0,
-        "max_speed": 5.0,
-    },
-}
+def _check_day(day: str) -> str:
+    try:
+        return validate_day(day)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+
+# ---------------------------------------------------------------------------
+# 运维
+# ---------------------------------------------------------------------------
 
 @app.get("/health", tags=["运维"])
 def health() -> dict[str, str]:
@@ -96,61 +78,185 @@ def health() -> dict[str, str]:
 @app.get("/", tags=["运维"])
 def root() -> dict[str, Any]:
     return {
-        "service": "bus-trip-mileage-matching",
+        "service": "bus-position-partition",
         "docs": "/docs",
         "redoc": "/redoc",
         "openapi": "/openapi.json",
+        "endpoints": {
+            "append": "POST /api/v1/partitions/{day}/batches",
+            "compact": "POST /api/v1/partitions/{day}/compact",
+            "read": "GET /api/v1/partitions/{day}/records",
+            "status": "GET /api/v1/partitions/{day}/status",
+            "reap": "POST /api/v1/partitions/{day}/reap",
+        },
     }
 
 
+# ---------------------------------------------------------------------------
+# 追加
+# ---------------------------------------------------------------------------
+
 @app.post(
-    "/api/v1/trips/match",
-    response_model=MatchResponse,
-    tags=["里程匹配"],
-    summary="单次行程里程匹配",
+    "/api/v1/partitions/{day}/batches",
+    response_model=AppendBatchResponse,
+    status_code=201,
+    tags=["定位分区"],
+    summary="追加一批定位记录（每批 1～1000 条，落为不可变 JSONL）",
+)
+def append_batch(
+    day: str = Path(..., description="运营日 YYYY-MM-DD"),
+    request: AppendBatchRequest = Body(
+        ..., openapi_examples=append_openapi_examples()
+    ),
+) -> AppendBatchResponse:
+    day = _check_day(day)
+    try:
+        result = storage.append_batch(day, request.records)
+    except storage.SequenceConflict as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return AppendBatchResponse(
+        day=day,
+        file_id=result.file_id,
+        file_name=result.file_name,
+        record_count=result.record_count,
+        byte_size=result.byte_size,
+        sequence=result.sequence,
+        checksum_sha256=result.checksum,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 压实
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/v1/partitions/{day}/compact",
+    response_model=CompactResponse,
+    tags=["定位分区"],
+    summary="按日压实：合并碎文件，保留全部记录与顺序，不去重",
+    responses={
+        409: {"description": "该日已有压实/回收或有读取进行中（按日锁，不影响其他日期）"},
+        422: {"description": "运营日格式非法"},
+    },
+)
+def compact_day(
+    day: str = Path(..., description="运营日 YYYY-MM-DD"),
+) -> CompactResponse:
+    day = _check_day(day)
+    try:
+        result = storage.compact_day(day)
+    except storage.CompactionBusy as exc:
+        # 同日已有压实进行：非全局锁，其他日期不受影响
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except storage.CompactionNothingToDo as exc:
+        return CompactResponse(
+            day=day,
+            merged_file_id=0,
+            merged_file_name="",
+            merged_records=0,
+            merged_source_files=0,
+            sealed_files=0,
+            reaped_files=0,
+            note=str(exc),
+        )
+    except storage.CompactionFailed as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return CompactResponse(day=day, note="ok", **result)
+
+
+# ---------------------------------------------------------------------------
+# 流式读取
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/api/v1/partitions/{day}/records",
+    tags=["定位分区"],
+    summary="流式读取当日全部记录（请求开始即固定快照，NDJSON）",
     responses={
         200: {
-            "description": "匹配成功返回 matched；无完整路径返回 no_path（均为 HTTP 200，"
-            "用 status 字段区分；请求参数本身非法时返回 422）。",
+            "description": (
+                "application/x-ndjson：每行一条定位记录 JSON，按批次提交"
+                "顺序、批内原序输出；响应头 X-Snapshot-Files 给出本次快照"
+                "固定的文件集合，X-Snapshot-Records 给出记录总数。"
+            ),
+            "content": {
+                "application/x-ndjson": {
+                    "example": (
+                        '{"vehicle_id":"BUS-1001","utc_ts":1762848000,'
+                        '"x":12150.5,"y":8320.0}\n'
+                        '{"vehicle_id":"BUS-1001","utc_ts":1762848015,'
+                        '"x":12260.2,"y":8321.7}\n'
+                    )
+                }
+            },
         }
     },
 )
-def match(
-    request: MatchRequest = Body(
-        ...,
-        openapi_examples={
-            "overlap": _OVERLAP_EXAMPLE,
-            "no_path": _NO_PATH_EXAMPLE,
-        },
+def read_records(day: str = Path(..., description="运营日 YYYY-MM-DD")) -> Any:
+    day = _check_day(day)
+    snapshot = storage.open_snapshot(day)
+    headers = {
+        "X-Snapshot-Files": ",".join(sf.file_name for sf in snapshot.files),
+        "X-Snapshot-Records": str(snapshot.total_records),
+        "X-Lease-Id": snapshot.lease_id,
+        "Cache-Control": "no-store",
+    }
+    return StreamingResponse(
+        snapshot.stream_lines(),
+        media_type="application/x-ndjson",
+        headers=headers,
     )
-) -> JSONResponse:
-    try:
-        matched = match_trip(request)
-    except NoPathError as exc:
-        payload = MatchFailure(
-            failed_index=exc.failed_index,
-            reason_code=exc.reason_code,  # type: ignore[arg-type]
-            reason=exc.reason,
-            candidates=[
-                CandidateInfo(
-                    segment_index=c.segment_index,
-                    mileage=round(c.mileage, 6),
-                    deviation=round(c.deviation, 6),
-                )
-                for c in exc.candidates[:50]
-            ],
-        )
-        return JSONResponse(content=payload.model_dump())
 
-    payload = MatchSuccess(
-        points=[
-            MatchedPoint(
-                index=i,
-                segment_index=c.segment_index,
-                mileage=round(c.mileage, 6),
-                deviation=round(c.deviation, 6),
+
+# ---------------------------------------------------------------------------
+# 状态与回收
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/api/v1/partitions/{day}/status",
+    response_model=PartitionStatusResponse,
+    tags=["定位分区"],
+    summary="查看当日分区文件索引状态",
+)
+def partition_status(day: str = Path(..., description="运营日 YYYY-MM-DD")) -> Any:
+    day = _check_day(day)
+    with db.connect() as conn:
+        status = db.partition_status(conn, day)
+    return PartitionStatusResponse(
+        day=status["day"],
+        active_files=status["active_files"],
+        compacting_files=status["compacting_files"],
+        sealed_files=status["sealed_files"],
+        total_records=status["total_records"],
+        total_active_bytes=status["total_active_bytes"],
+        files=[
+            PartitionFileInfo(
+                file_id=int(r["file_id"]),
+                file_name=r["file_name"],
+                sequence=int(r["sequence"]),
+                record_count=int(r["record_count"]),
+                byte_size=int(r["byte_size"]),
+                state=r["state"],
+                checksum_sha256=r["checksum"],
+                created_at=r["created_at"],
             )
-            for i, c in enumerate(matched)
-        ]
+            for r in status["rows"]
+        ],
     )
-    return JSONResponse(content=payload.model_dump())
+
+
+@app.post(
+    "/api/v1/partitions/{day}/reap",
+    response_model=ReapResponse,
+    tags=["定位分区"],
+    summary="手动回收 sealed 旧文件（无活跃读取时才真正删除）",
+)
+def reap_day(day: str = Path(..., description="运营日 YYYY-MM-DD")) -> ReapResponse:
+    day = _check_day(day)
+    try:
+        count = storage.reap_day(day, blocking=False)
+    except storage.ReapBusy as exc:
+        # 有读取/压实进行中：非阻塞跳过，不影响其他日期
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return ReapResponse(day=day, reaped_files=count, reaped_bytes=0)
